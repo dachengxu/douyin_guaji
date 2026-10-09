@@ -199,16 +199,48 @@ class underlying_operations:
         self.delay(random_wait_seconds)
 
     def check_countdown(self, last_time=''):
-        """对倒计时时间进行转化，变成秒存储"""
+        """对倒计时时间进行转化，变成秒存储。
+        兼容 '12:32'（4位）与 '4:30'（分钟<10，3位）等格式；
+        OCR 常把时间识别成乱码（如 '7[08] : 07'），故解析以冒号为锚点，
+        向两侧取紧邻的一段连续数字，容忍中间/两侧的乱码字符；
+        若字符串中无冒号，则退化为纯数字（4位 MMSS，3位 MSS）。
+        """
         try:
-            last_time = ''.join([char for char in last_time if char.isdigit()])
-            if len(last_time) == 4:
-                # minutes, seconds = map(int, last_time.split(':'))
-                minutes = int(last_time[:2])
-                seconds = int(last_time[2:])
-            else:
-                print("时间格式异常")
+            if not last_time:
+                print("时间格式异常：识别为空")
                 return False
+            # 找第一个中/英文冒号，作为 分:秒 的锚点
+            colon = next((i for i, ch in enumerate(last_time) if ch in '：:'), None)
+            if colon is not None:
+                # 冒号左侧：从冒号向左取紧邻的一段连续数字（忽略中间乱码）
+                before = ''
+                for ch in reversed(last_time[:colon]):
+                    if ch.isdigit():
+                        before = ch + before
+                    elif before:
+                        break
+                # 冒号右侧：从冒号向右取紧邻的一段连续数字
+                after = ''
+                for ch in last_time[colon + 1:]:
+                    if ch.isdigit():
+                        after += ch
+                    elif after:
+                        break
+                if before and after:
+                    minutes = int(before[-2:])   # 取最后1~2位，避免左侧误带多余数字
+                    seconds = int(after[:2])
+                else:
+                    print("时间格式异常")
+                    return False
+            else:
+                digits = ''.join(char for char in last_time if char.isdigit())
+                if len(digits) == 4:
+                    minutes, seconds = int(digits[:2]), int(digits[2:])
+                elif len(digits) == 3:
+                    minutes, seconds = int(digits[0]), int(digits[1:])
+                else:
+                    print("时间格式异常")
+                    return False
             # 转换为总秒数
             total_seconds = minutes * 60 + seconds
             print("剩余总秒数：", total_seconds)

@@ -6,10 +6,18 @@ from PIL import Image
 from datetime import datetime
 from Underlying_Operations import underlying_operations
 import json
+import find_fudai
 
 """
     当前版本 V4.3
     """
+
+# 福袋详情截图裁剪区域（参考分辨率 1080x2340，pre-y_pianyi 值）。
+# 实测多张超福袋截图：倒计时数字恒在“奖品标题行”右侧（y≈1204-1294, x≈755-928），
+# 奖品名恒在标题行下方（y≈1300-1400），与任务数量无关，故与 renwu 无关。
+# y_pianyi（默认 -50）会在 get_fudai_contain 内叠加到 y 坐标上。
+FUDAI_CONTENT_REGION = (390, 1230, 1000, 1470)
+FUDAI_COUNTDOWN_REGION = (700, 1230, 950, 1370)
 
 class Tee(object):
     """重写print的函数"""
@@ -270,66 +278,34 @@ class fudai_analyse:
 
     def check_have_fudai(self):
         """判定直播页面福袋的小图标是否存在
+
+        直接复用 find_fudai.locate_fudai（ROI 裁剪 + 多尺度模板匹配 + SIFT 交叉验证，
+        已真机验证），不再内置颜色扫描等中间数据。定位到则返回福袋中心 x(1080参考系)。
+
         Returns:
-            int or False: 如果找到福袋，返回x坐标；否则返回False
+            int or False: 找到则返回福袋中心 x(1080参考系)；否则返回 False
         """
-        path = os.path.dirname(__file__) + '/pic'
-        pic_path = path + '/screenshot.png'
-        max_loops = 5  # 最大循环次数
-        check_interval = 1.5  # 检查间隔时间
+        # 截图与裁剪产物在 pic/（运行时生成，gitignore）；福袋图标匹配模板在 target_pic/（提交入库）
+        pic_dir = os.path.dirname(__file__) + '/pic'
+        tpl_dir = os.path.dirname(__file__) + '/target_pic'
+        pic_path = pic_dir + '/screenshot.png'
+        max_loops = 5          # 最大循环次数
+        check_interval = 1.5   # 检查间隔时间
+
         for loop in range(max_loops):
             self.operation.delay(check_interval)
             print(f"第{loop+1}次判定直播间是否存在福袋，共计会判定{max_loops}次")
             self.operation.get_screenshot(self.device_id)
             try:
-                pic = Image.open(pic_path)
-                pic_new = pic.convert('RGBA')
-                pix = pic_new.load()
-                # 颜色范围
-                color_ranges = {
-                    'r': (183, 194),
-                    'g': (165, 193),
-                    'b': (237, 248)
-                }
-                # 检查每个x坐标
-                for base in [0, 126, 126 * 2, 126 * 3]:
-                    for x in range(34+base, 52+base):
-                        x_pos = x * self.resolution_ratio_x // 1080
-                        if self.y_pianyi != 0:
-                            # 检查三种偏移值的情况
-                            for y_offset in [0, self.y_pianyi, -self.y_pianyi]:
-                                y_pos = (403 + y_offset) * self.resolution_ratio_y // 2400
-                                pixel_color = pix[x_pos, y_pos]
-                                # 检查颜色是否在指定范围内
-                                if (color_ranges['r'][0] <= pixel_color[0] <= color_ranges['r'][1] and
-                                    color_ranges['g'][0] <= pixel_color[1] <= color_ranges['g'][1] and
-                                    color_ranges['b'][0] <= pixel_color[2] <= color_ranges['b'][1]):
-                                    self.last_find_fudai_time = time.time()
-                                    if y_offset != 0 and y_offset != self.y_pianyi:
-                                        self.y_pianyi = y_offset
-                                        print(f"重新调整偏移值到{y_offset}")
-                                    print(f"找到福袋X坐标：{x}")
-                                    if pic:
-                                        pic.close()
-                                    if self.device_id not in self.device_offsets:
-                                        self.device_offsets[self.device_id]=y_offset
-                                        self.operation.update_config_with_offsets("config.json",{self.device_id:y_offset})
-                                    return x
-                        else:
-                            y_pos = 403 * self.resolution_ratio_y // 2400
-                            pixel_color = pix[x_pos, y_pos]
-                            # 检查颜色是否在指定范围内
-                            if (color_ranges['r'][0] <= pixel_color[0] <= color_ranges['r'][1] and
-                                    color_ranges['g'][0] <= pixel_color[1] <= color_ranges['g'][1] and
-                                    color_ranges['b'][0] <= pixel_color[2] <= color_ranges['b'][1]):
-                                self.last_find_fudai_time = time.time()
-                                print(f"找到福袋X坐标：{x}")
-                                if pic:
-                                    pic.close()
-                                if self.device_id not in self.device_offsets:
-                                    self.device_offsets[self.device_id] = 0
-                                    self.operation.update_config_with_offsets("config.json", {self.device_id: 0})
-                                return x
+                res = find_fudai.locate_fudai(pic_path, tpl_dir)
+                if res is not None:
+                    rx = int(round(res['x_ref']))
+                    print(f"找到福袋X坐标：{rx}（{res['method']}）")
+                    self.last_find_fudai_time = time.time()
+                    if self.device_id not in self.device_offsets:
+                        self.device_offsets[self.device_id] = self.y_pianyi
+                        self.operation.update_config_with_offsets("config.json", {self.device_id: self.y_pianyi})
+                    return rx
             except Exception as e:
                 print(e)
                 # 处理特殊情况
@@ -727,25 +703,17 @@ class fudai_analyse:
         Returns:
             tuple: (fudai_content_text, time_text)
         """
-        # 定义不同任务数量对应的截图参数
-        task_params = {
-            1: {'content': (390, 1300, 1000, 1520), 'countdown': (390, 1190, 690, 1300)},
-            2: {'content': (390, 1240, 1000, 1460), 'countdown': (390, 1110, 690, 1220)},
-            3: {'content': (390, 1160, 1000, 1380), 'countdown': (390, 1010, 690, 1120)},
-            0: {'content': (390, 1600, 1000, 1820), 'countdown': (390, 1460, 690, 1570)}
-        }
-        
-        # 获取对应任务数量的参数
-        params = task_params.get(renwu, task_params[2])  # 默认使用2个任务的参数
-        
+        # 倒计时与内容区域为与 renwu 无关的常量（见模块级 FUDAI_*_REGION）。
+        # 这样即使 check_fudai_detail_height 偶尔误判 renwu，也不会裁错位置。
+        content_params = FUDAI_CONTENT_REGION
+        countdown_params = FUDAI_COUNTDOWN_REGION
+
         # 截取福袋内容
-        content_params = params['content']
-        self.cut_pic(content_params[0], content_params[1] + self.y_pianyi, 
-                    content_params[2], content_params[3] + self.y_pianyi, 
+        self.cut_pic(content_params[0], content_params[1] + self.y_pianyi,
+                    content_params[2], content_params[3] + self.y_pianyi,
                     '', 'fudai_content')
-        
+
         # 截取倒计时
-        countdown_params = params['countdown']
         self.cut_pic(countdown_params[0], countdown_params[1] + self.y_pianyi,
                     countdown_params[2], countdown_params[3] + self.y_pianyi,
                     '', 'fudai_countdown')
@@ -1104,9 +1072,15 @@ class fudai_analyse:
                 return True
             return False
 
-        def handle_countdown(x, stats, time_text):
-            """处理倒计时"""
-            result = self.operation.check_countdown(time_text)
+        def handle_countdown(x, stats, time_text, content_text=''):
+            """处理倒计时。
+            time_text 解析失败时，从 content_text（含 已参与/MM:SS）兜底，
+            避免倒计时区域偶尔截到空/半截导致误判异常。
+            """
+            def try_parse(text):
+                return self.operation.check_countdown(text)
+
+            result = try_parse(time_text) or try_parse(content_text)
             if result:
                 stats['fudai_not_open_times'] = 0
                 lastsecond, future_timestamp = result
@@ -1114,8 +1088,8 @@ class fudai_analyse:
             # 如果第一次失败，重新获取信息再试一次
             self.operation.delay(2)
             self.operation.get_screenshot(self.device_id)
-            _, time_text = get_fudai_info()
-            result = self.operation.check_countdown(time_text)
+            content_text, time_text = get_fudai_info()
+            result = try_parse(time_text) or try_parse(content_text)
             if result:
                 stats['fudai_not_open_times'] = 0
                 lastsecond, future_timestamp = result
@@ -1244,7 +1218,7 @@ class fudai_analyse:
                 continue
                 
             # 处理倒计时
-            countdown_result = handle_countdown(x, stats, time_text)
+            countdown_result = handle_countdown(x, stats, time_text, fudai_content_text)
             if countdown_result is None:
                 continue
                 
