@@ -297,7 +297,7 @@ class fudai_analyse:
             print(f"第{loop+1}次判定直播间是否存在福袋，共计会判定{max_loops}次")
             self.operation.get_screenshot(self.device_id)
             try:
-                res = find_fudai.locate_fudai(pic_path, tpl_dir)
+                res = find_fudai.locate_fudai(pic_path, tpl_dir, out_dir=pic_dir)
                 if res is not None:
                     rx = int(round(res['x_ref']))
                     print(f"找到福袋X坐标：{rx}（{res['method']}）")

@@ -133,7 +133,8 @@ def in_color_range(b, g, r):
     )
 
 
-def locate_fudai(img, pic_dir, roi_ref=DEFAULT_ROI_REF, match_threshold=MATCH_THRESHOLD):
+def locate_fudai(img, pic_dir, roi_ref=DEFAULT_ROI_REF, match_threshold=MATCH_THRESHOLD,
+                 out_dir=None):
     """在截图中定位福袋图标，返回定位结果 dict 或 None。
 
     逻辑：先按参考坐标裁出顶部 ROI 子图，再对每张 fudai*.png 图标模板做多尺度模板匹配，
@@ -145,6 +146,7 @@ def locate_fudai(img, pic_dir, roi_ref=DEFAULT_ROI_REF, match_threshold=MATCH_TH
         pic_dir: 模板所在目录
         roi_ref: ROI 参考坐标 (x0,y0,x1,y1)，1080x2400 系
         match_threshold: 模板匹配置信阈值
+        out_dir: 若提供，将裁剪出的 ROI 子图保存为 fudai_bar.png，便于人工观察
     Returns:
         dict: {'x_ref','y_ref','w_ref','h_ref'(参考系中心/尺寸),
                'score','method','bbox'(全图像素 x,y,w,h),'roi'(全图 ROI 像素)}
@@ -163,6 +165,13 @@ def locate_fudai(img, pic_dir, roi_ref=DEFAULT_ROI_REF, match_threshold=MATCH_TH
     if x1 <= x0 or y1 <= y0:
         return None
     sub = img[y0:y1, x0:x1]
+
+    # 保存福袋 ROI 子图（顶部悬浮条），方便人工核对是否包含福袋图标
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        bar_path = os.path.join(out_dir, "fudai_bar.png")
+        cv2.imwrite(bar_path, sub)
+        print(f"[观察图] 已保存福袋 ROI 子图: {bar_path}（顶部悬浮条，便于核对是否含福袋图标）")
 
     templates = list_templates(pic_dir)
     if not templates:
@@ -256,7 +265,8 @@ def main():
     print(f"模板: {[os.path.basename(t) for t in templates]}")
 
     # 定位福袋（ROI 裁剪 + 多尺度模板匹配 + SIFT 交叉验证），逻辑复用 locate_fudai()
-    res = locate_fudai(img, tpl_dir, roi_ref=roi_ref, match_threshold=MATCH_THRESHOLD)
+    res = locate_fudai(img, tpl_dir, roi_ref=roi_ref, match_threshold=MATCH_THRESHOLD,
+                       out_dir=pic_dir)
     if res is None:
         x0, y0, x1, y1 = (int(roi_ref[0] * ratio_x), int(roi_ref[1] * ratio_y),
                           min(iw, int(roi_ref[2] * ratio_x)), min(ih, int(roi_ref[3] * ratio_y)))
