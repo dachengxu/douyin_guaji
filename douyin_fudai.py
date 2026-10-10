@@ -1,5 +1,6 @@
 import os
 import random
+import re
 import sys
 import time
 from PIL import Image
@@ -8,16 +9,19 @@ from Underlying_Operations import underlying_operations
 import json
 import find_fudai
 
+# 倒计时正则：匹配 MM:SS 或 MM：SS（中文冒号、可有空格）
+TIME_RE = re.compile(r'(\d{1,2})\s*[:：]\s*(\d{1,2})')
+
 """
     当前版本 V4.3
     """
 
-# 福袋详情截图裁剪区域（参考分辨率 1080x2340，pre-y_pianyi 值）。
-# 实测多张超福袋截图：倒计时数字恒在“奖品标题行”右侧（y≈1204-1294, x≈755-928），
-# 奖品名恒在标题行下方（y≈1300-1400），与任务数量无关，故与 renwu 无关。
-# y_pianyi（默认 -50）会在 get_fudai_contain 内叠加到 y 坐标上。
+# 福袋内容区（参考分辨率 1080x2340，pre-y_pianyi 值）。倒计时不再用固定区域裁剪，
+# 因为“带任务”的超级福袋把倒计时挪到了“已参与”同一行（x≈540-760，位置随任务数量浮动），
+# 固定区域会截到空白。改为：下半屏OCR定位“已参与”后裁其紧邻小区域取倒计时。
 FUDAI_CONTENT_REGION = (390, 1230, 1000, 1470)
-FUDAI_COUNTDOWN_REGION = (700, 1230, 950, 1370)
+# 下半屏起始 y（pre-y_pianyi）；已参与行在 raw y≈1212~1605，1150 起步可覆盖所有形态
+FUDAI_LOWER_TOP = 1150
 
 class Tee(object):
     """重写print的函数"""
@@ -698,33 +702,61 @@ class fudai_analyse:
             return wait_time
         return 0
 
+    def get_fudai_countdown_text(self):
+        """获取福袋倒计时文本。
+        做法：裁剪下半屏并OCR，优先从拼接文本里用正则抓 MM:SS / MM：SS（最稳，
+        因为“已参与”所在行偶尔会被OCR漏检）；抓不到再定位“已参与”裁其紧邻小区域取倒计时。
+        兼容“带任务”与“无任务”等多种超级福袋形态，不再依赖固定裁剪区域。
+        返回文本交给 check_countdown 锚定第一个冒号解析成秒。
+        """
+        lower_top = max(0, FUDAI_LOWER_TOP + self.y_pianyi)
+        self.cut_pic(0, lower_top, 1080, 2340, '', 'fudai_lower')
+        items = self.operation.analyse_pic_word_boxes('fudai_lower', 0)
+        all_text = ''.join(t for _, (t, _c) in items)
+
+        # 1) 优先：下半屏拼接文本里直接抓倒计时（MM:SS / MM：SS）
+        if TIME_RE.search(all_text):
+            return all_text
+
+        # 2) 兜底：定位“已参与”，裁其紧邻小区域再OCR
+        yp = None
+        for bbox, (text, _conf) in items:
+            if '已参与' in text:
+                yp = bbox
+                break
+
+        if yp is not None:
+            xs = [p[0] for p in yp]
+            ys = [p[1] for p in yp]
+            x0 = max(0, int(min(xs)) - 10)
+            x1 = min(1080, int(max(xs)) + 360)
+            y0 = max(0, int(min(ys)) - 15)
+            y1 = min(2340 - lower_top, int(max(ys)) + 25)
+            self.cut_pic(x0, lower_top + y0, x1, lower_top + y1, '', 'fudai_countdown')
+            tight = self.operation.analyse_pic_word('fudai_countdown', 0)
+            if tight:
+                return tight
+        return all_text
+
     def get_fudai_contain(self, renwu=2):
         """获取福袋的内容和倒计时
         Returns:
             tuple: (fudai_content_text, time_text)
         """
-        # 倒计时与内容区域为与 renwu 无关的常量（见模块级 FUDAI_*_REGION）。
-        # 这样即使 check_fudai_detail_height 偶尔误判 renwu，也不会裁错位置。
         content_params = FUDAI_CONTENT_REGION
-        countdown_params = FUDAI_COUNTDOWN_REGION
 
         # 截取福袋内容
         self.cut_pic(content_params[0], content_params[1] + self.y_pianyi,
                     content_params[2], content_params[3] + self.y_pianyi,
                     '', 'fudai_content')
 
-        # 截取倒计时
-        self.cut_pic(countdown_params[0], countdown_params[1] + self.y_pianyi,
-                    countdown_params[2], countdown_params[3] + self.y_pianyi,
-                    '', 'fudai_countdown')
-        
         # 识别文本
         fudai_content_text = self.operation.analyse_pic_word('fudai_content', 1)
-        time_text = self.operation.analyse_pic_word('fudai_countdown', 2)
-        
+        time_text = self.get_fudai_countdown_text()
+
         print(f"福袋内容：{fudai_content_text}")
         print(f"倒计时时间：{time_text}")
-        
+
         return fudai_content_text, time_text
 
     def check_contain(self, contains='', current_hour=None):
@@ -746,7 +778,12 @@ class fudai_analyse:
         return False
 
     def attend_choujiang(self):
-        """点击参与抽奖
+        """点击参与抽奖。
+        改为下半屏OCR定位实际按钮（带坐标），点击其像素中心，兼容：
+          - 无任务形态：按钮“参与抽奖”
+          - 带任务形态：先点“一键发表评论”完成评论任务，按钮变为“参与抽奖”再点一次
+        注意：只匹配按钮文字（如“一键发表评论”），避免误点任务区里的“发送评论：...”描述文字；
+        多个候选命中同一关键词时取屏幕最下方（y 最大）的一个，即真正的按钮而非任务说明。
         Returns:
             bool: 是否成功参与抽奖
         """
@@ -755,103 +792,100 @@ class fudai_analyse:
             self.click(500, 470)
             print("点击福袋外部，关闭福袋详情")
             self.operation.delay(1)
-            
-        def handle_special_buttons():
-            """处理特殊按钮情况"""
-            if "加入粉丝团" in attend_button_text and "钻石" in attend_button_text:
-                close_fudai_detail()
-                return False
-            elif "活动已结束" in attend_button_text:
-                close_fudai_detail()
-                return False
-            elif "开通店铺会员" in attend_button_text:
-                self.operation.click_back(self.device_id)
-                self.operation.delay(1)
-                close_fudai_detail()
-                return False
-            elif "加入粉丝团（1钻石）" in attend_button_text:
-                close_fudai_detail()
-                return False
+
+        def find_button(keywords):
+            """在下半屏按钮列表里按关键词优先级，返回 (text, x, y) 或 None。
+            命中多个时取 y 最大（最靠下）的，确保点到真正的按钮而非任务描述。"""
+            buttons = self._find_action_buttons()
+            best = None
+            for kw in keywords:
+                for text, x, y in buttons:
+                    if kw in text and (best is None or y > best[2]):
+                        best = (text, x, y)
+                if best is not None:
+                    return best
             return None
-            
-        def handle_participation_buttons():
-            """处理参与按钮情况"""
-            if "评论" in attend_button_text or "参与抽奖" in attend_button_text:
-                self.click(500, 2060)
-                print("点击参与抽奖")
+
+        click_times = 0
+        while click_times < 3:
+            buttons = self._find_action_buttons()
+            attend_button_text = ''.join(t for t, _x, _y in buttons)
+            print(f"参与抽奖按钮文字内容：{attend_button_text}")
+
+            # 特殊按钮：粉丝团含钻石 / 活动结束 / 开通店铺会员
+            if ("加入粉丝团" in attend_button_text and "钻石" in attend_button_text) \
+               or "活动已结束" in attend_button_text \
+               or "开通店铺会员" in attend_button_text \
+               or "加入粉丝团（1钻石）" in attend_button_text:
+                close_fudai_detail()
+                return False
+
+            # 参与按钮（优先 一键发表评论 / 参与抽奖 / 开始观看）
+            target = find_button(['一键发表评论', '参与抽奖', '开始观看'])
+            if target is not None:
+                text, x, y = target
+                self.click(x, y)
+                print(f"点击参与按钮：{text}")
                 self.operation.delay(2)
+                # 二次判定：发表评论后按钮应变为“参与抽奖”，再点一次完成参与
+                self.operation.get_screenshot(self.device_id)
+                buttons2 = self._find_action_buttons()
+                attend_button_text2 = ''.join(t for t, _x, _y in buttons2)
+                print(f"二次判定参与抽奖按钮文字内容：{attend_button_text2}")
+                target2 = find_button(['参与抽奖', '一键发表评论', '开始观看'])
+                if target2 is not None:
+                    self.click(target2[1], target2[2])
+                    print(f"二次点击参与按钮：{target2[0]}")
+                    self.operation.delay(2)
+                    return True
+                if any(k in attend_button_text2 for k in
+                       ['参与成功', '还需看播', '任务已完成', '已达成']):
+                    close_fudai_detail()
+                    return True
                 return True
-            elif "开始观看" in attend_button_text:
-                self.click(500, 2060)
-                print("点击开始观看直播，参与抽奖")
-                return True
-            elif "粉丝团" in attend_button_text:
-                self.click(500, 2060)
+
+            # 已参与 / 状态按钮（含“任务已完成等待开奖”等已参与形态）
+            if any(k in attend_button_text for k in
+                   ['参与成功', '还需看播', '无法参与', '时长不足', '不满足参与条件',
+                    '任务已完成', '等待开奖', '已完成', '待开奖']):
+                if any(k in attend_button_text for k in
+                       ['参与成功', '还需看播', '任务已完成', '等待开奖', '已完成', '待开奖']):
+                    print("已经参与/任务已完成，等待开奖")
+                    close_fudai_detail()
+                    return True
+                print("条件不满足，无法参与抽奖")
+                close_fudai_detail()
+                return False
+
+            # 加入/点亮粉丝团（非钻石）
+            target_fans = find_button(['粉丝团'])
+            if target_fans is not None and '钻石' not in attend_button_text:
+                self.click(target_fans[1], target_fans[2])
                 print("点击加入粉丝团、点亮粉丝团")
                 self.operation.delay(2)
                 close_fudai_detail()
                 return False
-            return None
-            
-        def handle_status_buttons():
-            """处理状态按钮情况"""
-            if "参与成功" in attend_button_text:
-                print("已经参与，等待开奖")
-                close_fudai_detail()
-                return True
-            elif "还需看播" in attend_button_text:
-                print("已经参与，等待看播时间凑齐开奖")
-                close_fudai_detail()
-                return True
-            elif "无法参与" in attend_button_text:
-                print("条件不满足，无法参与抽奖")
-                close_fudai_detail()
-                return False
-            elif "时长不足" in attend_button_text:
-                print("看播时长不够了，无法参与抽奖")
-                close_fudai_detail()
-                return False
-            elif "不满足参与条件" in attend_button_text:
-                print("不满足参与条件，无法参与抽奖")
-                close_fudai_detail()
-                return False
-            return None
 
-        click_times = 0
-        while click_times < 2:
-            self.cut_pic(306, 2030, 780, 2130, '', 'attend_button')
-            attend_button_text = self.operation.analyse_pic_word('attend_button', 1)
-            print(f"参与抽奖按钮文字内容：{attend_button_text}")
-            
-            # 处理特殊按钮情况
-            result = handle_special_buttons()
-            if result is not None:
-                return result
-                
-            # 处理参与按钮情况
-            result = handle_participation_buttons()
-            if result is not None:
-                # 第一次点击参与后，立即二次判定是否出现“开始观看”等需要第二次点击的状态
-                self.operation.get_screenshot(self.device_id)
-                self.cut_pic(306, 2030, 780, 2130, '', 'attend_button')
-                attend_button_text = self.operation.analyse_pic_word('attend_button', 1)
-                print(f"二次判定参与抽奖按钮文字内容：{attend_button_text}")
-                result_second = handle_participation_buttons()
-                if result_second is not None:
-                    return result_second
-                return result
-                
-            # 处理状态按钮情况
-            result = handle_status_buttons()
-            if result is not None:
-                return result
-                
-            # 未匹配到任何情况
             print("参与抽奖按钮文字没匹配上")
             click_times += 1
-            
+
         print("参与抽奖多次点击失败")
         return False
+
+    def _find_action_buttons(self):
+        """下半屏OCR，返回所有文字块 (text, 中心x, 中心y[raw截图坐标]) 列表，
+        供定位“一键发表评论 / 参与抽奖 / 开始观看 / 粉丝团”等按钮的真实位置。"""
+        lower_top = max(0, FUDAI_LOWER_TOP + self.y_pianyi)
+        self.cut_pic(0, lower_top, 1080, 2340, '', 'fudai_lower')
+        items = self.operation.analyse_pic_word_boxes('fudai_lower', 0)
+        buttons = []
+        for bbox, (text, _conf) in items:
+            xs = [p[0] for p in bbox]
+            ys = [p[1] for p in bbox]
+            cx = (min(xs) + max(xs)) / 2
+            cy = (min(ys) + max(ys)) / 2
+            buttons.append((text, cx, lower_top + cy))
+        return buttons
 
     def check_lucky_draw_result(self):
         """判定福袋抽奖的结果"""

@@ -189,6 +189,28 @@ class underlying_operations:
         # print(contain)
         return contains
 
+    def analyse_pic_word_boxes(self, picname='', change_color=0):
+        """识别图像中的文字，返回带坐标的原始结果列表。
+        每项结构为 [bbox, (文本, 置信度)]，bbox 为四边形四角坐标（相对被识别图片）。
+        用于定位特定文字（如“已参与”、按钮）的像素位置。
+        """
+        path = os.path.dirname(__file__) + '/pic'
+        if picname == '':
+            pic = path + '/cut.png'
+        else:
+            pic = path + '/' + picname + '.png'
+        img = Image.open(pic)
+        img = img.convert('L')  # 转换为灰度图
+        if change_color == 1:
+            img = img.point(lambda x: 0 if x < 128 else 255)  # 二值化
+        elif change_color == 2:
+            img = img.point(lambda x: 0 if x < 180 else 255)  # 二值化
+        img_np = np.array(img)
+        result = self.ocr.ocr(img_np)
+        if result == [None]:
+            return []
+        return result[0]
+
     def delay(self, seconds=1):
         time.sleep(seconds)
 
